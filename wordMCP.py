@@ -1,58 +1,69 @@
-import sys
-import json
 import os
 import requests
+import re
 from io import BytesIO
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt, Inches
+from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.routing import Mount
+import uvicorn
 
-def clean_mermaid(code):
-    return code.replace("```mermaid", "").replace("```", "").strip()
+# Initialize the MCP Server
+mcp = FastMCP("ContentServer")
 
-def add_mermaid_diagram(doc, mermaid_code):
+def clean_mermaid(text_from_ai):
+    """Extracts Mermaid code even if the AI surrounds it with conversational text."""
+    match = re.search(r'```(?:mermaid)?\n(.*?)\n```', text_from_ai, re.DOTALL | re.IGNORECASE)
+    
+    if match:
+        code = match.group(1)
+    else:
+        code = text_from_ai.replace("```mermaid", "").replace("```", "")
+        
+    lines = [line.strip() for line in code.split("\n") if line.strip()]
+    return "\n".join(lines)
+
+def fetch_diagram_bytes(mermaid_code):
+    """Helper function to fetch the raw PNG bytes from ChartQuery API"""
+    cleaned_code = clean_mermaid(mermaid_code)
+    
+    print("\n" + "="*40)
+    print("🛠️  DEBUG: MERMAID CODE SENT TO API:")
+    print(cleaned_code)
+    print("="*40 + "\n")
+    
     url = "https://api.chartquery.com/v1/diagram"
     payload = {
         "diagram_type": "mermaid",
-        "diagram_source": mermaid_code,
+        "diagram_source": cleaned_code,
         "output_format": "png",
         "share": True
     }
     try:
         response = requests.post(url, json=payload, timeout=30)
-        sys.stderr.write(f"API POST Status: {response.status_code}\n")
         
         if response.status_code == 200:
-            api_data = response.json()
-            render_url = api_data.get("render_url")
-            
+            render_url = response.json().get("render_url")
             if not render_url:
-                sys.stderr.write(f"Error: JSON response missing 'render_url'. Body: {api_data}\n")
-                return False
-                
-            sys.stderr.write(f"Successfully got URL: {render_url}\nFetching image...\n")
+                print("❌ ERROR: API succeeded but 'render_url' was missing in JSON.")
+                return None
+            print("Render url:",render_url)
             img_response = requests.get(render_url, timeout=30)
-            
             if img_response.status_code == 200 and 'image' in img_response.headers.get('Content-Type', ''):
-                image_stream = BytesIO(img_response.content)
-                
-                # REVERTED: Back to 6.0 inches for maximum legibility. 
-                # Word will automatically calculate the height to maintain aspect ratio.
-                doc.add_picture(image_stream, width=Inches(6.0))
-                
-                last_p = doc.paragraphs[-1]
-                last_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                return True
+                print("✅ SUCCESS: Diagram generated and downloaded.")
+                return img_response.content
             else:
-                sys.stderr.write(f"Error fetching image bytes. Content-Type: {img_response.headers.get('Content-Type')}\n")
-                return False
+                print(f"❌ ERROR: Failed to download image from render_url. Status: {img_response.status_code}")
+                return None
         else:
-            sys.stderr.write(f"API Error: {response.status_code}\nResponse: {response.text[:100]}\n")
-            return False
+            print(f"❌ API ERROR ({response.status_code}): {response.text}")
+            return None
             
     except Exception as e:
-        sys.stderr.write(f"Diagram POST/GET Error: {str(e)}\n")
-        return False
+        print(f"❌ FATAL REQUEST ERROR: {str(e)}")
+        return None
 
 def create_or_edit_word(file_path, content=None, title=None, mermaid_code=None):
     try:
@@ -61,145 +72,156 @@ def create_or_edit_word(file_path, content=None, title=None, mermaid_code=None):
 
         doc = Document(file_path) if os.path.exists(file_path) else Document()
         
-        # 1. HEADER LOGIC
         if title:
             t = doc.add_heading(title, 0)
             t.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        # 2. DIAGRAM LOGIC
         if mermaid_code:
             doc.add_heading("System Architecture Diagram", level=2)
-            clean_code = clean_mermaid(mermaid_code)
-            success = add_mermaid_diagram(doc, clean_code)
-            
-            if not success:
+            img_bytes = fetch_diagram_bytes(mermaid_code)
+            if img_bytes:
+                doc.add_picture(BytesIO(img_bytes), width=Inches(6.0))
+                doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            else:
                 doc.save(file_path)
-                return "Error: Diagram API failed. The mermaid syntax might be invalid or the API is down."
+                return "Error: Diagram API failed. Check the Server Terminal for the exact syntax error."
 
-        # 3. TEXT CONTENT LOGIC
         if content and isinstance(content, str) and content.strip():
             blocks = content.split('\n\n')
             for block in blocks:
                 block = block.strip()
                 if not block: continue
 
-                # --- TABLE DETECTION ---
+                # Table Logic
                 if "|" in block and "\n" in block:
                     lines = block.split('\n')
                     if len([l for l in lines if '|' in l]) > 1:
                         rows = [l.split('|') for l in lines if '|' in l]
-                        
                         table_data = []
                         for r in rows:
                             cleaned_row = [cell.strip() for cell in r]
                             if cleaned_row and cleaned_row[0] == '': cleaned_row.pop(0)
                             if cleaned_row and cleaned_row[-1] == '': cleaned_row.pop()
                             if not cleaned_row: continue
-                            
-                            is_separator = all(all(char in "-: " for char in cell) for cell in cleaned_row)
-                            if not is_separator:
+                            if not all(all(char in "-: " for char in cell) for cell in cleaned_row):
                                 table_data.append(cleaned_row)
                         
                         if table_data:
                             max_cols = max(len(row) for row in table_data)
                             table = doc.add_table(rows=len(table_data), cols=max_cols)
                             table.style = 'Table Grid'
-                            
                             for r_idx, row_data in enumerate(table_data):
                                 for c_idx, val in enumerate(row_data):
                                     if c_idx < max_cols:
-                                        cell = table.cell(r_idx, c_idx)
-                                        p = cell.paragraphs[0]
-                                        parts = val.split("**")
-                                        for i, part in enumerate(parts):
+                                        p = table.cell(r_idx, c_idx).paragraphs[0]
+                                        for i, part in enumerate(val.split("**")):
                                             run = p.add_run(part)
                                             if i % 2 != 0: run.bold = True
                                         if r_idx == 0:
                                             for run in p.runs: run.bold = True
                             continue
 
-                # --- PROCESS STANDARD TEXT ---
-                lines = block.split('\n')
-                for line in lines:
+                # Standard Text Logic
+                for line in block.split('\n'):
                     line = line.strip()
                     if not line: continue
                     
-                    # Aggressive AI Artifact Filter
                     line_lower = line.lower()
                     if ("diagram" in line_lower and "inserted" in line_lower) or line.startswith("*(") or line == "*":
                         continue
 
-                    # Page Breaks
+                    # --- UPDATED PAGE FORMATTING LOGIC ---
                     if line.startswith("**Page ") or line.startswith("Page "):
-                        if "Page 1" not in line: doc.add_page_break()
-                        doc.add_heading(line.replace("**", ""), level=1)
+                        if "Page 1" not in line: 
+                            doc.add_page_break()
+                        
+                        # Remove the bold stars
+                        clean_line = line.replace("**", "")
+                        
+                        # Split by the colon and keep only the actual title
+                        if ":" in clean_line:
+                            clean_title = clean_line.split(":", 1)[1].strip()
+                        else:
+                            clean_title = re.sub(r'(?i)Page\s+\d+', '', clean_line).strip()
+                            
+                        if clean_title:
+                            doc.add_heading(clean_title, level=1)
                         continue
                         
-                    # Markdown Headings
-                    if line.startswith("### "):
-                        doc.add_heading(line.replace("### ", "").replace("**", ""), level=3)
-                        continue
-                    elif line.startswith("## "):
-                        doc.add_heading(line.replace("## ", "").replace("**", ""), level=2)
-                        continue
-                    elif line.startswith("# "):
-                        doc.add_heading(line.replace("# ", "").replace("**", ""), level=1)
-                        continue
+                    if line.startswith("### "): doc.add_heading(line.replace("### ", "").replace("**", ""), level=3); continue
+                    if line.startswith("## "): doc.add_heading(line.replace("## ", "").replace("**", ""), level=2); continue
+                    if line.startswith("# "): doc.add_heading(line.replace("# ", "").replace("**", ""), level=1); continue
 
-                    # Bullet Points
                     if line.startswith("* ") or line.startswith("- "):
                         p = doc.add_paragraph(style='List Bullet')
                         line = line[2:].strip()
                     else:
                         p = doc.add_paragraph()
 
-                    # Bolding Logic
-                    parts = line.split("**")
-                    for i, part in enumerate(parts):
+                    for i, part in enumerate(line.split("**")):
                         run = p.add_run(part)
                         if i % 2 != 0: run.bold = True
 
         doc.save(file_path)
-        return f"Success: Document updated at {os.path.abspath(file_path)}"
+        return f"Success: Word Document updated at {os.path.abspath(file_path)}"
     except Exception as e:
         return f"Error: {str(e)}"
 
-def main():
-    line = sys.stdin.readline()
-    if not line: return
+# --- TOOL 1: Create Word Document ---
+@mcp.tool()
+def write_to_word(file_path: str, content: str, title: str = None) -> str:
+    """Create a structured Word document. 
+    - Use '**Page X: Title**' for sections. 
+    - Use Markdown style tables.
+    - ABSOLUTELY NO PLACEHOLDERS: Do NOT write text like '(Diagram will be inserted here)'.
     
-    try:
-        request = json.loads(line)
-        params = request.get("params", {})
-        tool_name = params.get("name")
-        args = params.get("arguments", {})
+    CRITICAL INSTRUCTION: If the user asked for a Word document AND a diagram, you MUST call this tool AND the 'insert_diagram' tool at the same time! Do not leave the diagram out!"""
+    return create_or_edit_word(file_path=file_path, content=content, title=title)
 
-        result_text = ""
-        if tool_name == "write_to_word":
-            result_text = create_or_edit_word(
-                file_path=args.get('file_path'), 
-                content=args.get('content', ''), 
-                title=args.get('title')
-            )
-        elif tool_name == "insert_diagram":
-            result_text = create_or_edit_word(
-                file_path=args.get('file_path'), 
-                mermaid_code=args.get('description', '')
-            )
-        else:
-            sys.stderr.write(f"Unknown tool: {tool_name}\n")
-            return
+# --- TOOL 2: Append Diagram to Existing Word Doc ---
+@mcp.tool()
+def insert_diagram(file_path: str, mermaid_syntax: str) -> str:
+    """Use this tool to append a Mermaid.js architectural diagram image into an EXISTING Word Document. 
+    CRITICAL: If the user asked for a new document AND a diagram, you MUST call 'write_to_word' AND this tool together in the same response.
+    
+    CRITICAL SYNTAX RULES:
+    1. The 'mermaid_syntax' argument MUST contain RAW MERMAID CODE ONLY. Do NOT include any conversational English text.
+    2. Start the code exactly with `graph TD`.
+    3. Quote ALL node labels. Example: A["Client"] --> B["Server"]
+    4. NO TEXT ON ARROWS. Do NOT use the pipe `|` character."""
+    return create_or_edit_word(file_path=file_path, mermaid_code=mermaid_syntax)
 
-        response = {
-            "jsonrpc": "2.0", 
-            "id": request.get("id"), 
-            "result": {"content": [{"type": "text", "text": result_text}]}
-        }
-        sys.stdout.write(json.dumps(response) + "\n")
-        sys.stdout.flush()
+# --- TOOL 3: Save Diagram as Standalone PNG ---
+@mcp.tool()
+def save_diagram_png(file_path: str, mermaid_syntax: str) -> str:
+    """Use this tool when the user ONLY wants an image file (.png), NOT a Word document (.docx).
+    Generates an architectural diagram using Mermaid.js and saves it directly as a standalone PNG.
+    
+    CRITICAL SYNTAX RULES:
+    1. The 'mermaid_syntax' argument MUST contain RAW MERMAID CODE ONLY. Do NOT include any conversational English text.
+    2. Start the code exactly with `graph TD`.
+    3. Quote ALL node labels. Example: A["Client"] --> B["Server"]
+    4. NO TEXT ON ARROWS. Do NOT use the pipe `|` character."""
+    if not file_path.lower().endswith('.png'):
+        file_path += '.png'
         
-    except Exception as e:
-        sys.stderr.write(f"Fatal Script Error: {str(e)}\n")
+    img_bytes = fetch_diagram_bytes(mermaid_syntax)
+    if img_bytes:
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(img_bytes)
+            return f"Success: Standalone diagram saved to {os.path.abspath(file_path)}"
+        except Exception as e:
+            return f"Error writing file: {str(e)}"
+    return "Error: Failed to fetch diagram from API."
+
+# --- ASGI Server Setup ---
+app = Starlette(
+    routes=[
+        Mount("/", app=mcp.sse_app())
+    ]
+)
 
 if __name__ == "__main__":
-    main()
+    print("🚀 Starting MCP Server on SSE transport (http://localhost:8000/sse)")
+    uvicorn.run("wordMCP:app", host="127.0.0.1", port=8000, reload=True)

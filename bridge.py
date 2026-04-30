@@ -1,118 +1,71 @@
-import requests
+import asyncio
 import json
-import subprocess
+import requests
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "gemma4:e4b"  
+MODEL = "gemma4:e4b"
+MCP_SERVER_URL = "http://localhost:8000/sse"
 
-def call_word_mcp(tool_name, args):
-    mcp_request = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": args}
-    }
-    
-    process = subprocess.Popen(
-        ['python3', 'wordMCP.py'], 
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    
-    stdout, stderr = process.communicate(input=json.dumps(mcp_request))
-    
-    if stderr.strip():
-        print(f"\n[DEBUG] wordMCP.py stderr:\n{stderr.strip()}\n")
-    
-    if not stdout.strip():
-        if stderr:
-            return {"result": {"content": [{"text": f"Script Error: {stderr}"}]}}
-        return {"result": {"content": [{"text": "Error: Script returned no output"}]}}
-
-    return json.loads(stdout)
-
-def chat(prompt):
-    payload = {
-        "model": MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "write_to_word",
-                    "description": """Create a structured Word document. 
-- Use '**Page X: Title**' for sections. 
-- Use Markdown style tables.
-- ABSOLUTELY NO PLACEHOLDERS: Do NOT write text like '(Diagram will be inserted here)'.
-- Title and Page 1 will automatically be placed together.""",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {"type": "string", "description": "Full path including .docx extension"},
-                            "content": {"type": "string", "description": "Text content for the doc"},
-                            "title": {"type": "string", "description": "Optional title"}
-                        },
-                        "required": ["file_path", "content"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "insert_diagram",
-                    "description": """Generates an architectural diagram image using Mermaid.js. 
-CRITICAL SYNTAX RULES (FAILURE TO FOLLOW WILL CRASH THE SYSTEM):
-1. Use `graph TD`.
-2. ALL node labels MUST be wrapped in double quotes. Example: A["Source Code"] --> B["Lexer"].
-3. ABSOLUTELY NO TEXT ON ARROWS. You are FORBIDDEN from using the pipe `|` character for arrows. 
-   - FATAL ERROR: A -->|tokens| B
-   - CORRECT: A --> B
-4. Put all descriptive text, including acronyms like (IR) or (AST), INSIDE the double-quoted node labels.""",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "file_path": {
-                                "type": "string", 
-                                "description": "Must be the exact same file_path used in the write_to_word tool so they go to the same document."
-                            },
-                            "description": {
-                                "type": "string", 
-                                "description": "Raw Mermaid code. FORBIDDEN: `-->|text|`. REQUIRED: plain `-->` ONLY. Quote all nodes."
-                            },
-                            "caption": {"type": "string", "description": "Text to appear below the diagram"}
-                        },
-                        "required": ["file_path", "description"]
-                    }
-                }
-            }
-        ]
-    }
+async def chat(prompt):
+    print(f"🔄 Connecting to MCP Server at {MCP_SERVER_URL}...")
     
     try:
-        response = requests.post(OLLAMA_URL, json=payload).json()
-        if 'message' not in response:
-            print("Ollama Error:", response)
-            return
+        async with sse_client(MCP_SERVER_URL) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                print("✅ Connected successfully!")
 
-        message = response['message']
+                mcp_tools = await session.list_tools()
 
-        if 'tool_calls' in message:
-            for tool in message['tool_calls']:
-                name = tool['function']['name']
-                args = tool['function']['arguments']
-                print(f"--- AI is calling tool: {name} ---")
+                ollama_tools = []
+                for t in mcp_tools.tools:
+                    ollama_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.inputSchema
+                        }
+                    })
+
+                payload = {
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "tools": ollama_tools
+                }
                 
-                result = call_word_mcp(name, args)
-                print(f"--- Result: {result['result']['content'][0]['text']} ---")
-        else:
-            print(f"AI: {message['content']}")
-            
+                print("🧠 Sending prompt to Ollama...")
+                response = requests.post(OLLAMA_URL, json=payload).json()
+                
+                if 'message' not in response:
+                    print("Ollama Error:", response)
+                    return
+
+                message = response['message']
+
+                if 'tool_calls' in message:
+                    # SAFETY SORTER: Force 'write_to_word' to always be executed first
+                    tool_calls = sorted(
+                        message['tool_calls'], 
+                        key=lambda x: 0 if x['function']['name'] == 'write_to_word' else 1
+                    )
+
+                    for tool in tool_calls:
+                        name = tool['function']['name']
+                        args = tool['function']['arguments']
+                        print(f"\n--- AI is calling tool: {name} ---")
+                        
+                        result = await session.call_tool(name, arguments=args)
+                        print(f"--- Result: {result.content[0].text} ---\n")
+                else:
+                    print(f"\nAI: {message['content']}\n")
+
     except Exception as e:
-        print(f"Bridge Error: {str(e)}")
+        print(f"\n❌ Connection Error: Ensure your server is running. ({str(e)})")
 
 if __name__ == "__main__":
     user_input = input("Enter The Prompt: ")
-    chat(user_input)
+    asyncio.run(chat(user_input))
