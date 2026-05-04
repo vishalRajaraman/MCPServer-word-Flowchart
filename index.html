@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WORD DOCUMENT GENERATOR</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Montserrat:wght@800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Glowing background orbs -->
+        <div class="glow-orb orb-1"></div>
+        <div class="glow-orb orb-2"></div>
+
+        <header class="app-header">
+            <h1 class="main-title">WORD DOCUMENT GENERATOR</h1>
+            <p class="subtitle">AI-Powered Creation Engine</p>
+        </header>
+
+        <main class="chat-interface glass-panel">
+            <div class="messages-container" id="messagesContainer">
+                <div class="message bot-message">
+                    <div class="avatar bot-avatar">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>
+                    </div>
+                    <div class="message-content">
+                        Hello! I am ready to generate your Word documents. You can type instructions or attach references (images, PDFs, DOCX).
+                    </div>
+                </div>
+            </div>
+
+            <div class="input-area-wrapper">
+                <div class="file-preview-container" id="filePreviewContainer" style="display: none;">
+                    <!-- Previews will be injected here -->
+                </div>
+                
+                <div class="input-container">
+                    <button class="icon-button plus-button" id="attachButton" title="Attach Files">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+                    </button>
+                    <input type="file" id="fileInput" multiple accept="image/*,.pdf,.doc,.docx" style="display: none;" />
+                    
+                    <input type="text" id="messageInput" class="text-input" placeholder="Type a message or describe the document..." />
+                    
+                    <button class="icon-button send-button" id="sendButton" title="Send">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+                    </button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
